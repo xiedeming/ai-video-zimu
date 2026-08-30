@@ -1,0 +1,11 @@
+node_modules/
+out/
+dist/
+release/
+coverage/
+.vite/
+*.log
+resources/bin/win32-x64/*
+!resources/bin/win32-x64/.gitkeep
+resources/models/*
+!resources/models/.gitkeep

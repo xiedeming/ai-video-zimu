@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --canvas: 9 13 20;
+  --surface: 15 21 31;
+  --elevated: 21 29 42;
+  --line: 42 54 72;
+  --primary: 91 141 255;
+  --success: 53 200 154;
+  --warning: 245 185 76;
+  --danger: 255 107 107;
+  --ink: 235 241 250;
+  --muted: 159 173 193;
+  font-family: 'Segoe UI', 'Microsoft YaHei UI', 'Yu Gothic UI', sans-serif;
+  color: rgb(var(--ink));
+  background: rgb(var(--canvas));
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+
+body { min-width: 1120px; min-height: 720px; background: rgb(var(--canvas)); }
+
+button, input, textarea, select { font: inherit; }
+
+button, [role='button'], input, textarea, select { outline: none; }
+
+button:focus-visible, [role='button']:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+  box-shadow: 0 0 0 3px rgba(91, 141, 255, .32);
+  border-color: rgb(var(--primary));
+}
+
+button:disabled { cursor: not-allowed; opacity: .46; }
+
+::selection { background: rgba(91, 141, 255, .34); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(159, 173, 193, .24); border: 3px solid transparent; background-clip: padding-box; border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(159, 173, 193, .4); border: 3px solid transparent; background-clip: padding-box; }
+
+@layer components {
+  .btn {
+    @apply inline-flex min-h-11 cursor-pointer items-center justify-center gap-2 rounded-lg border border-line bg-elevated px-4 text-sm font-semibold text-ink transition-colors duration-150 hover:border-muted/60 hover:bg-line/60 active:translate-y-px disabled:cursor-not-allowed disabled:active:translate-y-0;
+  }
+  .btn-primary { @apply border-primary bg-primary text-white hover:border-primary hover:bg-primary/90; }
+  .btn-ghost { @apply border-transparent bg-transparent text-muted hover:border-line hover:bg-elevated hover:text-ink; }
+  .btn-danger { @apply border-danger/30 bg-danger/10 text-danger hover:bg-danger/20; }
+  .icon-btn { @apply inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-transparent text-muted transition-colors duration-150 hover:border-line hover:bg-elevated hover:text-ink disabled:cursor-not-allowed; }
+  .panel { @apply rounded-xl border border-line bg-surface; }
+  .input { @apply min-h-11 rounded-lg border border-line bg-canvas px-3 text-sm text-ink placeholder:text-muted/60 hover:border-muted/60; }
+  .label { @apply text-xs font-semibold uppercase tracking-[.08em] text-muted; }
+  .badge { @apply inline-flex h-6 items-center rounded-md border border-line bg-elevated px-2 text-xs font-semibold text-muted; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}
