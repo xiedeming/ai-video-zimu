@@ -1,5 +1,6 @@
 import { createServer } from 'node:net'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
+import { availableParallelism } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -23,6 +24,14 @@ interface ActiveJob {
   process?: ChildProcessWithoutNullStreams
   checkpointProject?: ZimuProjectV1
   remainingSegmentIds?: string[]
+  options?: PipelineOptions
+}
+
+export interface PipelineOptions {
+  jobId?: string
+  translate?: boolean
+  concurrency?: number
+  checkpoint?: (project: ZimuProjectV1) => Promise<void>
 }
 
 async function availablePort(): Promise<number> {
@@ -51,8 +60,17 @@ function languageFromWhisper(raw: Record<string, unknown>, requested: ZimuProjec
 export class JobManager {
   private jobs = new Map<string, ActiveJob>()
   private listeners = new Set<JobListener>()
+  private localTranslationTail: Promise<void> = Promise.resolve()
+  private localServer?: { child: ChildProcessWithoutNullStreams; controller: AbortController; resolved: ResolvedTranslationProfile }
 
   constructor(private models: ModelManager, private profiles: TranslationProfileManager) {}
+
+  dispose(): void {
+    for (const jobId of this.jobs.keys()) this.cancel(jobId)
+    this.localServer?.controller.abort()
+    this.localServer?.child.kill()
+    this.localServer = undefined
+  }
 
   onEvent(listener: JobListener): () => void {
     this.listeners.add(listener)
@@ -75,15 +93,15 @@ export class JobManager {
     this.listeners.forEach((listener) => listener(event))
   }
 
-  start(projectInput: ZimuProjectV1): { jobId: string } {
+  start(projectInput: ZimuProjectV1, options: PipelineOptions = {}): { jobId: string } {
     const project = projectSchema.parse(projectInput)
-    const jobId = randomUUID()
-    this.jobs.set(jobId, { controller: new AbortController(), startedAt: Date.now(), projectId: project.id })
+    const jobId = options.jobId ?? randomUUID()
+    this.jobs.set(jobId, { controller: new AbortController(), startedAt: Date.now(), projectId: project.id, options })
     void this.runPipeline(jobId, project)
     return { jobId }
   }
 
-  retranslate(projectInput: ZimuProjectV1, segmentIds?: string[], operation: 'retranslate' | 'continue' = 'retranslate'): { jobId: string } {
+  retranslate(projectInput: ZimuProjectV1, segmentIds?: string[], operation: 'retranslate' | 'continue' = 'retranslate', options: PipelineOptions = {}): { jobId: string } {
     const project = projectSchema.parse(projectInput)
     if (segmentIds !== undefined && !segmentIds.length) {
       throw Object.assign(new Error('没有可翻译的字幕段'), { code: 'TRANSLATION_NO_SEGMENTS' })
@@ -91,8 +109,8 @@ export class JobManager {
     if (segmentIds !== undefined && !project.segments.some((segment) => segmentIds.includes(segment.id))) {
       throw Object.assign(new Error('找不到需要翻译的字幕段，请刷新项目后重试'), { code: 'TRANSLATION_SEGMENTS_NOT_FOUND' })
     }
-    const jobId = randomUUID()
-    this.jobs.set(jobId, { controller: new AbortController(), startedAt: Date.now(), projectId: project.id })
+    const jobId = options.jobId ?? randomUUID()
+    this.jobs.set(jobId, { controller: new AbortController(), startedAt: Date.now(), projectId: project.id, options })
     void this.runTranslationOnly(jobId, project, segmentIds, operation)
     return { jobId }
   }
@@ -117,7 +135,7 @@ export class JobManager {
       const transcriptionModelId = project.settings.transcriptionModelId
       await this.models.assertReady([transcriptionModelId, 'silero-vad-v6.2'])
       this.emit(jobId, 'probing', 5, '正在读取媒体信息')
-      const workDir = join(getAppPaths().cache, project.id)
+      const workDir = join(getAppPaths().cache, jobId)
       await mkdir(workDir, { recursive: true })
       const useGpu = await hasNvidiaGpu()
       const audioPath = join(workDir, 'audio-16k.wav')
@@ -137,18 +155,28 @@ export class JobManager {
         language,
         outputBase,
         vadModelPath: this.models.pathFor('silero-vad-v6.2'),
-        useGpu
+        useGpu,
+        logicalProcessors: Math.max(1, Math.floor(availableParallelism() / (job.options?.concurrency ?? 1)))
       })
-      const tracked = spawnTracked(whisper, whisperArgs, {
+      const processOptions = {
         signal,
-        onStderr: (chunk) => {
+        onStderr: (chunk: string) => {
           const matches = [...chunk.matchAll(/(\d{1,3})%/g)]
           const value = Number(matches.at(-1)?.[1])
           if (Number.isFinite(value)) this.emit(jobId, 'transcribing', 18 + value * 0.47, `正在识别语音 · ${value}%`)
         }
-      })
+      }
+      const tracked = spawnTracked(whisper, whisperArgs, processOptions)
       job.process = tracked.child
-      await tracked.result
+      try { await tracked.result } catch (error) {
+        if (!useGpu || signal.aborted) throw error
+        this.emit(jobId, 'transcribing', 18, 'GPU 识别失败，正在使用 CPU 重试')
+        const cpu = await resolveBinary('whisper-cli', false)
+        const fallback = spawnTracked(cpu, [...whisperArgs, '--no-gpu'], processOptions)
+        job.process = fallback.child
+        await fallback.result
+      }
+      job.process = undefined
       const whisperRaw = JSON.parse(await readFile(`${outputBase}.json`, 'utf8')) as Record<string, unknown>
       const detectedLanguage = languageFromWhisper(whisperRaw, project.sourceLanguage)
       const transcription = (whisperRaw.transcription ?? whisperRaw.segments ?? []) as Parameters<typeof normalizeAndMergeWhisperSegments>[0]
@@ -166,6 +194,12 @@ export class JobManager {
       })
       job.checkpointProject = transcribed
       job.remainingSegmentIds = segments.map((segment) => segment.id)
+      await job.options?.checkpoint?.(transcribed)
+      if (signal.aborted) throw Object.assign(new Error('任务已取消'), { code: 'CANCELED' })
+      if (job.options?.translate === false) {
+        this.emit(jobId, 'completed', 100, '字幕已生成，可以开始校对', transcribed)
+        return
+      }
       const transcriptionSeconds = ((Date.now() - transcriptionStartedAt) / 1000).toFixed(1)
       this.emit(jobId, 'translating', 68, `识别完成 · 原始 ${segments.length + normalized.mergedCount} 段，合并 ${normalized.mergedCount} 段，保留 ${segments.length} 段 · ${transcriptionSeconds} 秒；正在翻译`)
       const translated = await this.translateProject(jobId, transcribed, segments, 68, 99, useGpu)
@@ -174,6 +208,7 @@ export class JobManager {
       if (signal.aborted || (error as { code?: string }).code === 'CANCELED') this.emit(jobId, 'canceled', 0, '任务已取消', job.checkpointProject, undefined, job.remainingSegmentIds)
       else this.emit(jobId, 'failed', 0, (error as Error).message || '任务失败', job.checkpointProject, (error as { code?: string }).code ?? 'JOB_FAILED', job.remainingSegmentIds)
     } finally {
+      await rm(join(getAppPaths().cache, jobId), { recursive: true, force: true }).catch(() => undefined)
       this.jobs.delete(jobId)
     }
   }
@@ -212,36 +247,41 @@ export class JobManager {
     endProgress: number,
     useGpu: boolean
   ): Promise<ZimuProjectV1> {
+    const resolved = await this.profiles.resolve(project.settings.translationProfileId)
+    if (resolved.profile.kind !== 'builtin') return this.translateProjectUnlocked(jobId, project, selected, startProgress, endProgress, useGpu)
+    const previous = this.localTranslationTail
+    let release!: () => void
+    const turn = new Promise<void>((resolve) => { release = resolve })
+    this.localTranslationTail = previous.then(() => turn)
+    try {
+      const signal = this.jobs.get(jobId)!.controller.signal
+      await new Promise<void>((resolve, reject) => {
+        const canceled = () => { signal.removeEventListener('abort', canceled); reject(Object.assign(new Error('任务已取消'), { code: 'CANCELED' })) }
+        if (signal.aborted) { canceled(); return }
+        signal.addEventListener('abort', canceled, { once: true })
+        void previous.then(() => { signal.removeEventListener('abort', canceled); resolve() })
+      })
+      if (signal.aborted) throw Object.assign(new Error('任务已取消'), { code: 'CANCELED' })
+      return await this.translateProjectUnlocked(jobId, project, selected, startProgress, endProgress, useGpu)
+    } finally { release() }
+  }
+
+  private async translateProjectUnlocked(
+    jobId: string,
+    project: ZimuProjectV1,
+    selected: SubtitleSegment[],
+    startProgress: number,
+    endProgress: number,
+    useGpu: boolean
+  ): Promise<ZimuProjectV1> {
     const job = this.jobs.get(jobId)!
     const { controller } = job
     let resolved = await this.profiles.resolve(project.settings.translationProfileId)
-    let localProcess: ChildProcessWithoutNullStreams | undefined
     if (resolved.profile.kind === 'builtin') {
       await this.models.assertReady(['qwen3-8b-q4-k-m'])
-      const port = await availablePort()
-      const apiKey = randomBytes(24).toString('hex')
-      let llama: string
-      try {
-        llama = await resolveBinary('llama-server', true)
-      } catch (error) {
-        if ((error as { code?: string }).code === 'SIDECAR_MISSING') {
-          throw Object.assign(new Error('当前项目选择的是“本地 Qwen3”，因此需要 llama-server。若要使用远程 API，请在工作区的“翻译服务”下拉框中选择已配置的远程服务。'), {
-            code: 'LLAMA_SIDECAR_REQUIRED_FOR_BUILTIN'
-          })
-        }
-        throw error
-      }
-      const tracked = spawnTracked(llama, [
-        '-m', this.models.pathFor('qwen3-8b-q4-k-m'), '--host', '127.0.0.1', '--port', String(port),
-        '--api-key', apiKey, '-ngl', useGpu ? '99' : '0', '-c', '8192', '--jinja'
-      ], { signal: controller.signal })
-      localProcess = tracked.child
-      job.process = tracked.child
-      tracked.result.catch(() => undefined)
-      await this.waitForServer(port, apiKey, controller.signal)
-      resolved = { profile: { ...resolved.profile, baseUrl: `http://127.0.0.1:${port}/v1` }, apiKey }
+      resolved = await this.localTranslationProfile(resolved, useGpu, controller.signal)
     }
-    try {
+    {
       const batches: SubtitleSegment[][] = []
       let current: SubtitleSegment[] = []
       let characters = 0
@@ -289,8 +329,38 @@ export class JobManager {
         this.emit(jobId, 'translating', startProgress + ratio * (endProgress - startProgress), `正在翻译 · ${completed}/${selected.length}`, currentProject, undefined, job.remainingSegmentIds)
       }
       return currentProject
-    } finally {
-      localProcess?.kill()
+    }
+  }
+
+  private async localTranslationProfile(resolved: ResolvedTranslationProfile, useGpu: boolean, signal: AbortSignal): Promise<ResolvedTranslationProfile> {
+    if (this.localServer) return this.localServer.resolved
+    const start = async (gpu: boolean): Promise<ResolvedTranslationProfile> => {
+      const port = await availablePort()
+      const apiKey = randomBytes(24).toString('hex')
+      const controller = new AbortController()
+      const llama = await resolveBinary('llama-server', gpu)
+      const tracked = spawnTracked(llama, [
+        '-m', this.models.pathFor('qwen3-8b-q4-k-m'), '--host', '127.0.0.1', '--port', String(port),
+        '--api-key', apiKey, '-ngl', gpu ? '99' : '0', '-c', '8192', '-t', String(Math.max(1, Math.min(8, Math.floor(availableParallelism() / 2)))), '--jinja'
+      ], { signal: controller.signal })
+      const profile = { profile: { ...resolved.profile, baseUrl: `http://127.0.0.1:${port}/v1` }, apiKey }
+      const exited = tracked.result.then(() => { throw new Error('本地翻译进程已退出') })
+      try {
+        await Promise.race([this.waitForServer(port, apiKey, AbortSignal.any([signal, controller.signal])), exited])
+        if (signal.aborted) throw Object.assign(new Error('任务已取消'), { code: 'CANCELED' })
+        this.localServer = { child: tracked.child, controller, resolved: profile }
+        const clear = () => { if (this.localServer?.child === tracked.child) this.localServer = undefined }
+        void tracked.result.then(clear, clear)
+        return profile
+      } catch (error) {
+        controller.abort()
+        tracked.child.kill()
+        throw error
+      }
+    }
+    try { return await start(useGpu) } catch (error) {
+      if (!useGpu || signal.aborted) throw error
+      return start(false)
     }
   }
 

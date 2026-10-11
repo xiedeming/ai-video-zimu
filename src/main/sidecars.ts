@@ -96,6 +96,7 @@ export function spawnTracked(command: string, args: string[], options: ProcessOp
       else reject(Object.assign(new Error(stderr.trim() || `${command} 退出，代码 ${exitCode}`), { exitCode, stdout, stderr }))
     })
   })
+  if (options.signal?.aborted) abort()
   return { child, result }
 }
 

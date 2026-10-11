@@ -5,6 +5,8 @@ import { ExportDialog } from './components/ExportDialog'
 import { Home } from './components/Home'
 import { ModelDialog } from './components/ModelDialog'
 import { Workspace } from './components/Workspace'
+import { BatchDialog } from './components/BatchDialog'
+import { TaskCenter } from './components/TaskCenter'
 import { useEditorStore } from './store'
 
 interface ToastState { message: string; kind: 'error' | 'success' }
@@ -22,6 +24,13 @@ export function App() {
   const applyJobEvent = useEditorStore((state) => state.applyJobEvent)
   const undo = useEditorStore((state) => state.undo)
   const redo = useEditorStore((state) => state.redo)
+  const queue = useEditorStore((state) => state.queue)
+  const activeJobId = useEditorStore((state) => state.activeJobId)
+  const documents = useEditorStore((state) => state.documents)
+  const applyQueue = useEditorStore((state) => state.applyQueue)
+  const [batchOpen, setBatchOpen] = useState(false)
+  const [batchPaths, setBatchPaths] = useState<string[]>([])
+  const [tasksOpen, setTasksOpen] = useState(false)
   const [modelOpen, setModelOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
   const [toast, setToast] = useState<ToastState>()
@@ -55,7 +64,9 @@ export function App() {
       if (event.stage === 'completed') notify(event.message, 'success')
       if (event.stage === 'failed') notify(event.message, 'error')
     })
-    return () => { stopModels(); stopJobs(); if (toastTimer.current) clearTimeout(toastTimer.current) }
+    const stopQueue = window.zimu.queue.onUpdate(applyQueue)
+    void window.zimu.queue.snapshot().then((snapshot) => { applyQueue(snapshot); if (snapshot.recovery) setTasksOpen(true) }).catch(() => notify('无法恢复任务队列，请检查应用数据目录', 'error'))
+    return () => { stopModels(); stopJobs(); stopQueue(); if (toastTimer.current) clearTimeout(toastTimer.current) }
   }, [])
 
   useEffect(() => {
@@ -100,12 +111,16 @@ export function App() {
 
   const save = async () => {
     const current = useEditorStore.getState().document
-    if (!current) return
+    if (!current || useEditorStore.getState().activeJobId) return
     try {
       const result = await window.zimu.project.save(current.project, current.filePath)
       if (result) {
-        setDocument(result)
-        markSaved(result.filePath)
+        if (useEditorStore.getState().document?.project.id === current.project.id) {
+          // Do not replace edits made while the save dialog was open.
+          if (useEditorStore.getState().document?.project.updatedAt === current.project.updatedAt) { setDocument(result); markSaved(result.filePath) }
+        } else {
+          useEditorStore.setState((state) => ({ documents: { ...state.documents, [current.project.id]: result }, sessions: { ...state.sessions, [current.project.id]: { ...state.sessions[current.project.id], dirty: false } } }))
+        }
         setRecent(await window.zimu.project.recent())
         notify('项目已保存', 'success')
       }
@@ -117,17 +132,38 @@ export function App() {
     setDoc(null)
     void loadBase()
   }
+  const openBatch = (paths: string[] = []) => { setTasksOpen(false); setBatchPaths(paths); setBatchOpen(true) }
+  const selectProject = (id: string) => {
+    if (useEditorStore.getState().document?.project.id !== id) useEditorStore.getState().switchProject(id)
+    setTasksOpen(false)
+    const selected = useEditorStore.getState().document
+    if (selected && !selected.mediaUrl) void window.zimu.media.toUrl(selected.project.media.path).then((mediaUrl) => {
+      useEditorStore.setState((state) => ({
+        documents: { ...state.documents, [id]: { ...state.documents[id], mediaUrl } },
+        document: state.document?.project.id === id ? { ...state.document, mediaUrl } : state.document
+      }))
+    }).catch(() => notify('无法读取项目媒体', 'error'))
+  }
 
   return (
-    <div className="h-full bg-canvas pt-9">
+    <div className="flex h-full flex-col bg-canvas pt-9">
       <div className="fixed left-0 right-0 top-0 z-[100] flex h-9 items-center border-b border-line bg-surface px-3 text-xs text-muted" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
         <Captions size={14} className="mr-2 text-primary" /><span>字幕工坊</span>
       </div>
+      <nav className="flex h-14 shrink-0 items-center gap-3 border-b border-line bg-surface px-5" aria-label="项目与任务">
+        <label className="label">项目 <select className="input ml-2 max-w-[260px]" value={document?.project.id ?? ''} onChange={(event) => { if (event.target.value) selectProject(event.target.value) }}><option value="">选择项目</option>{Object.values(documents).map((item) => <option key={item.project.id} value={item.project.id}>{item.project.title}</option>)}</select></label>
+        {activeJobId && <span className="text-xs text-warning">正在生成 · 字幕只读</span>}
+        <button className="btn ml-auto" onClick={() => openBatch()}>批量生成字幕</button><button className="btn" onClick={() => setTasksOpen(true)}>任务中心 · {queue.tasks.filter((task) => ['waiting', 'running', 'interrupted'].includes(task.state)).length}</button>
+      </nav>
+      <div className="min-h-0 flex-1">
       {document ? (
-        <Workspace onBack={back} onSave={save} onExport={() => setExportOpen(true)} onModels={() => setModelOpen(true)} notify={notify} />
+        <Workspace key={document.project.id} onBack={back} onSave={save} onExport={() => setExportOpen(true)} onModels={() => setModelOpen(true)} notify={notify} />
       ) : (
-        <Home models={models} recent={recent} onImport={importMedia} onOpen={open} onOpenRecent={openRecent} onModels={() => setModelOpen(true)} notify={notify} />
+        <Home models={models} recent={recent} onImport={importMedia} onBatch={openBatch} onOpen={open} onOpenRecent={openRecent} onModels={() => setModelOpen(true)} notify={notify} />
       )}
+      </div>
+      <BatchDialog open={batchOpen} paths={batchPaths} onClose={() => setBatchOpen(false)} onSubmitted={() => { setBatchOpen(false); setTasksOpen(true) }} notify={notify} />
+      <TaskCenter open={tasksOpen} onClose={() => setTasksOpen(false)} onAdd={() => openBatch()} onProject={selectProject} notify={notify} />
       <ModelDialog open={modelOpen} onOpenChange={setModelOpen} notify={notify} />
       {document && <ExportDialog open={exportOpen} onOpenChange={setExportOpen} project={document.project} notify={notify} />}
       {toast && (

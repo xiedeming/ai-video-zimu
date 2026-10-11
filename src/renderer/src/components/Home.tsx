@@ -4,11 +4,12 @@ import { DEFAULT_TRANSCRIPTION_MODEL_ID, type ModelState, type RecentProject } f
 import { useEditorStore } from '../store'
 
 export function Home({
-  models, recent, onImport, onOpen, onOpenRecent, onModels, notify
+  models, recent, onImport, onBatch, onOpen, onOpenRecent, onModels, notify
 }: {
   models: ModelState[]
   recent: RecentProject[]
   onImport: (path?: string) => Promise<void>
+  onBatch: (paths: string[]) => void
   onOpen: () => Promise<void>
   onOpenRecent: (filePath: string) => Promise<void>
   onModels: () => void
@@ -25,7 +26,12 @@ export function Home({
   const drop = async (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
     setDragging(false)
-    const file = event.dataTransfer.files[0]
+    const files = Array.from(event.dataTransfer.files)
+    if (files.length > 1) {
+      onBatch(files.map((file) => window.zimu.media.pathForFile(file)))
+      return
+    }
+    const file = files[0]
     if (!file) return
     const path = window.zimu.media.pathForFile(file)
     if (!path) return notify('无法读取拖入文件的本地路径', 'error')

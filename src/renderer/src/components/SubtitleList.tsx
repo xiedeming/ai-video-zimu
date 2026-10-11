@@ -39,6 +39,7 @@ function SubtitleRow({ segment, index, selected, onSelect, onRetranslate, retran
 
   return (
     <article className={cn('group absolute left-0 top-0 w-full px-3 py-2', selected && 'z-10')}>
+      <fieldset disabled={retranslationDisabled}>
       <div className={cn('rounded-xl border bg-surface p-3 transition-colors', selected ? 'border-primary shadow-[0_0_0_1px_rgba(91,141,255,.24)]' : 'border-line hover:border-muted/50')} onMouseDown={onSelect}>
         <div className="flex items-center gap-2">
           <span className="flex h-7 min-w-7 items-center justify-center rounded-md bg-elevated px-1.5 font-mono text-xs font-bold text-muted">{index + 1}</span>
@@ -60,6 +61,7 @@ function SubtitleRow({ segment, index, selected, onSelect, onRetranslate, retran
           <textarea aria-label={`第 ${index + 1} 段中文`} className="min-h-[54px] resize-none rounded-lg border border-primary/30 bg-primary/[.045] px-3 py-2 text-[14px] leading-5 text-ink hover:border-primary/60" value={translation} onChange={(event) => setTranslation(event.target.value)} onBlur={() => { if (translation !== segment.translatedText) updateSegment(segment.id, { translatedText: translation }) }} />
         </div>
       </div>
+      </fieldset>
     </article>
   )
 }
@@ -130,10 +132,10 @@ export const SubtitleList = memo(function SubtitleList({ onSeek, onRetranslate, 
           {search && <button className="absolute right-1 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center text-muted hover:text-ink" onClick={() => setSearch('')} aria-label="清除搜索"><X size={15} /></button>}
         </div>
         <button className={cn('btn px-3', lowConfidenceOnly && 'border-warning/40 bg-warning/10 text-warning')} onClick={toggleLowConfidence}><AlertTriangle size={16} />低置信度</button>
-        <button className="btn px-3" onClick={() => setShowReplace(!showReplace)}><CornerDownRight size={16} />替换</button>
+        <button className="btn px-3" disabled={Boolean(activeJobId)} onClick={() => setShowReplace(!showReplace)}><CornerDownRight size={16} />替换</button>
         <button className="btn px-3" onClick={cleanDuplicates} disabled={!duplicatePreview.mergedCount} title={duplicatePreview.mergedCount ? `可合并 ${duplicatePreview.mergedCount} 段，跳过 ${duplicatePreview.skippedConflictCount} 处冲突` : '没有可安全合并的相邻重复字幕'}><ListCollapse size={16} />合并重复{duplicatePreview.mergedCount > 0 && <span className="badge ml-1 border-primary/30 text-primary">{duplicatePreview.mergedCount}</span>}</button>
         <div className="mx-1 h-6 w-px bg-line" />
-        <Tooltip label="在当前字幕后添加"><button className="icon-btn" onClick={addSegment} aria-label="添加字幕"><Plus size={18} /></button></Tooltip>
+        <Tooltip label="在当前字幕后添加"><button className="icon-btn" disabled={Boolean(activeJobId)} onClick={addSegment} aria-label="添加字幕"><Plus size={18} /></button></Tooltip>
         <Tooltip label="在播放头处分割"><button className="icon-btn" onClick={() => splitSegment()} aria-label="分割字幕" disabled={!selectedId}><Scissors size={18} /></button></Tooltip>
       </div>
       {showReplace && <div className="flex items-center gap-2 border-b border-line bg-surface px-3 py-2"><span className="label">替换为</span><input className="input h-10 min-h-10 flex-1" value={replacement} onChange={(event) => setReplacement(event.target.value)} placeholder="输入替换文本" /><button className="btn h-10 min-h-10" onClick={replaceAll} disabled={!search}>全部替换</button></div>}

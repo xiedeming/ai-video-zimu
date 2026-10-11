@@ -1,7 +1,23 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { ExportRequest, JobEvent, ModelManifestItem, ModelProgressEvent, TranslationProfileInput, ZimuApi, ZimuProjectV1 } from '../shared/types'
+import { projectJobEventSchema, queueSnapshotSchema } from '../shared/queue'
 
 const api: ZimuApi = {
+  queue: {
+    choose: () => ipcRenderer.invoke('queue:choose'),
+    validate: (request) => ipcRenderer.invoke('queue:validate', request),
+    submit: async (request) => queueSnapshotSchema.parse(await ipcRenderer.invoke('queue:submit', request)),
+    snapshot: async () => queueSnapshotSchema.parse(await ipcRenderer.invoke('queue:snapshot')),
+    control: async (request) => queueSnapshotSchema.parse(await ipcRenderer.invoke('queue:control', request)),
+    onUpdate: (handler) => {
+      const listener = (_event: Electron.IpcRendererEvent, snapshot: unknown) => {
+        const parsed = queueSnapshotSchema.safeParse(snapshot)
+        if (parsed.success) handler(parsed.data)
+      }
+      ipcRenderer.on('queue:update', listener)
+      return () => ipcRenderer.removeListener('queue:update', listener)
+    }
+  },
   app: {
     getInfo: () => ipcRenderer.invoke('app:info')
   },
@@ -43,12 +59,15 @@ const api: ZimuApi = {
     test: (id: string, input?: TranslationProfileInput) => ipcRenderer.invoke('translation-profiles:test', id, input)
   },
   jobs: {
-    start: (project: ZimuProjectV1) => ipcRenderer.invoke('jobs:start', project),
+    start: (project: ZimuProjectV1, filePath?: string) => ipcRenderer.invoke('jobs:start', project, filePath),
     cancel: (jobId: string) => ipcRenderer.invoke('jobs:cancel', jobId),
-    retranslate: (project: ZimuProjectV1, segmentIds?: string[]) => ipcRenderer.invoke('jobs:retranslate', project, segmentIds),
-    continueTranslation: (project: ZimuProjectV1) => ipcRenderer.invoke('jobs:continue-translation', project),
+    retranslate: (project: ZimuProjectV1, segmentIds?: string[], filePath?: string) => ipcRenderer.invoke('jobs:retranslate', project, segmentIds, filePath),
+    continueTranslation: (project: ZimuProjectV1, filePath?: string) => ipcRenderer.invoke('jobs:continue-translation', project, filePath),
     onEvent: (handler) => {
-      const listener = (_event: Electron.IpcRendererEvent, jobEvent: JobEvent) => handler(jobEvent)
+      const listener = (_event: Electron.IpcRendererEvent, jobEvent: JobEvent) => {
+        const parsed = projectJobEventSchema.safeParse(jobEvent)
+        if (parsed.success) handler(parsed.data)
+      }
       ipcRenderer.on('jobs:event', listener)
       return () => ipcRenderer.removeListener('jobs:event', listener)
     }

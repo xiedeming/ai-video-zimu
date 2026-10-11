@@ -40,7 +40,6 @@ export function Workspace({ onBack, onSave, onExport, onModels, notify }: {
   const setLanguage = useEditorStore((state) => state.setLanguage)
   const setTranscriptionModel = useEditorStore((state) => state.setTranscriptionModel)
   const setTranslationProfile = useEditorStore((state) => state.setTranslationProfile)
-  const setActiveJob = useEditorStore((state) => state.setActiveJob)
   const activeJobId = useEditorStore((state) => state.activeJobId)
   const jobEvent = useEditorStore((state) => state.jobEvent)
   const undo = useEditorStore((state) => state.undo)
@@ -105,26 +104,23 @@ export function Workspace({ onBack, onSave, onExport, onModels, notify }: {
     if (!document.mediaUrl) return notify('原始媒体已丢失，请先重新关联', 'error')
     if (project.segments.length && !confirm('重新识别会替换当前全部字幕，是否继续？')) return
     try {
-      const { jobId } = await window.zimu.jobs.start(project)
-      setActiveJob(jobId)
+      await window.zimu.jobs.start(project, document?.filePath)
     } catch (error) { notify(error instanceof Error ? error.message : String(error), 'error') }
   }
 
   const retranslate = useCallback(async (ids?: string[]) => {
     if (!translationReady) { notify(translationProfile ? '当前翻译服务尚未就绪' : '项目使用的翻译配置不存在，请重新选择', 'error'); onModels(); return }
     try {
-      const { jobId } = await window.zimu.jobs.retranslate(project, ids)
-      setActiveJob(jobId)
+      await window.zimu.jobs.retranslate(project, ids, document?.filePath)
     } catch (error) { notify(error instanceof Error ? error.message : String(error), 'error') }
-  }, [notify, onModels, project, setActiveJob, translationProfile, translationReady])
+  }, [notify, onModels, project, document?.filePath, translationProfile, translationReady])
 
   const continueTranslation = useCallback(async () => {
     if (!translationReady) { notify(translationProfile ? '当前翻译服务尚未就绪' : '项目使用的翻译配置不存在，请重新选择', 'error'); onModels(); return }
     try {
-      const { jobId } = await window.zimu.jobs.continueTranslation(project)
-      setActiveJob(jobId)
+      await window.zimu.jobs.continueTranslation(project, document?.filePath)
     } catch (error) { notify(error instanceof Error ? error.message : String(error), 'error') }
-  }, [notify, onModels, project, setActiveJob, translationProfile, translationReady])
+  }, [notify, onModels, project, document?.filePath, translationProfile, translationReady])
 
   const relink = async () => {
     const result = await window.zimu.project.relinkMedia(project)

@@ -185,6 +185,14 @@ export interface RecentProject {
 }
 
 export interface ZimuApi {
+  queue: {
+    choose: () => Promise<string[]>
+    validate: (request: import('./queue').BatchRequest) => Promise<import('./queue').BatchValidationRow[]>
+    submit: (request: import('./queue').BatchRequest) => Promise<import('./queue').QueueSnapshot>
+    snapshot: () => Promise<import('./queue').QueueSnapshot>
+    control: (request: import('./queue').QueueControl) => Promise<import('./queue').QueueSnapshot>
+    onUpdate: (handler: (snapshot: import('./queue').QueueSnapshot) => void) => () => void
+  }
   app: {
     getInfo: () => Promise<{
       version: string
@@ -226,10 +234,10 @@ export interface ZimuApi {
     test: (id: string, input?: TranslationProfileInput) => Promise<TranslationProfileTestResult>
   }
   jobs: {
-      start: (project: ZimuProjectV1) => Promise<{ jobId: string }>
+      start: (project: ZimuProjectV1, filePath?: string) => Promise<{ jobId: string }>
       cancel: (jobId: string) => Promise<void>
-      retranslate: (project: ZimuProjectV1, segmentIds?: string[]) => Promise<{ jobId: string }>
-      continueTranslation: (project: ZimuProjectV1) => Promise<{ jobId: string }>
+      retranslate: (project: ZimuProjectV1, segmentIds?: string[], filePath?: string) => Promise<{ jobId: string }>
+      continueTranslation: (project: ZimuProjectV1, filePath?: string) => Promise<{ jobId: string }>
       onEvent: (handler: (event: JobEvent) => void) => () => void
   }
   subtitles: {

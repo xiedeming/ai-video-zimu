@@ -3,8 +3,16 @@ import type {
   JobEvent, ModelState, ProjectDocument, RecentProject, SourceLanguage, SubtitleSegment, TranscriptionModelId, TranslationProfile, ZimuProjectV1
 } from '../../shared/types'
 import { mergeAdjacentDuplicateSegments, repairSegmentOverlaps, type MergeAdjacentDuplicateResult } from '../../shared/subtitles'
+import type { QueueSnapshot } from '../../shared/queue'
+
+type EditorSession = Pick<EditorState, 'dirty' | 'history' | 'future' | 'selectedId' | 'playheadMs' | 'search' | 'lowConfidenceOnly'>
 
 interface EditorState {
+  documents: Record<string, ProjectDocument>
+  sessions: Record<string, EditorSession>
+  queue: QueueSnapshot
+  applyQueue: (queue: QueueSnapshot) => void
+  switchProject: (projectId: string) => void
   document: ProjectDocument | null
   models: ModelState[]
   translationProfiles: TranslationProfile[]
@@ -50,6 +58,45 @@ function projectWithSegments(project: ZimuProjectV1, segments: SubtitleSegment[]
 }
 
 export const useEditorStore = create<EditorState>((set, get) => ({
+  documents: {},
+  sessions: {},
+  queue: { tasks: [], paused: false, concurrency: 1, recovery: false },
+  applyQueue: (queue) => set((state) => {
+    let documents = state.documents
+    let sessions = state.sessions
+    const previousTasks = new Map(state.queue.tasks.map((task) => [task.jobId, task]))
+    let document = state.document
+    let dirty = state.dirty
+    let completedCurrent = false
+    for (const task of queue.tasks) {
+      const previous = previousTasks.get(task.jobId)
+      const changed = !previous || previous.state !== task.state || previous.project.updatedAt !== task.project.updatedAt
+      const known = documents[task.projectId]
+      if (!known || changed && ['running', 'succeeded', 'failed', 'canceled'].includes(task.state)) {
+        const next = { project: task.project, filePath: task.filePath, mediaUrl: known?.mediaUrl }
+        if (documents === state.documents) documents = { ...documents }
+        documents[task.projectId] = next
+        if (previous && ['waiting', 'running', 'interrupted'].includes(previous.state) && ['succeeded', 'failed', 'canceled'].includes(task.state)) {
+          if (sessions === state.sessions) sessions = { ...sessions }
+          delete sessions[task.projectId]
+        }
+        const terminalUpdate = previous && ['waiting', 'running', 'interrupted'].includes(previous.state) && ['succeeded', 'failed', 'canceled'].includes(task.state)
+        if (document?.project.id === task.projectId && (!dirty || state.activeJobId || task.state === 'running' || terminalUpdate)) {
+          document = { ...document, ...next, mediaUrl: document.mediaUrl }
+          dirty = task.state === 'failed' && task.failedStage === 'saving'
+          if (terminalUpdate) completedCurrent = true
+        }
+      }
+    }
+    const current = queue.tasks.find((task) => task.projectId === document?.project.id && ['waiting', 'running', 'interrupted'].includes(task.state))
+    return { queue, documents, sessions, document, dirty, activeJobId: current?.jobId,
+      selectedId: document?.project.segments.some((segment) => segment.id === state.selectedId) ? state.selectedId : document?.project.segments[0]?.id,
+      ...(completedCurrent ? { history: [], future: [] } : {}) }
+  }),
+  switchProject: (projectId) => {
+    const document = get().documents[projectId]
+    if (document) get().setDocument(document)
+  },
   document: null,
   models: [],
   translationProfiles: [],
@@ -60,7 +107,19 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   future: [],
   search: '',
   lowConfidenceOnly: false,
-  setDocument: (document) => set({ document, selectedId: document?.project.segments[0]?.id, dirty: false, history: [], future: [], jobEvent: undefined, activeJobId: undefined }),
+  setDocument: (document) => set((state) => {
+    const documents = { ...state.documents }
+    const sessions = { ...state.sessions }
+    if (state.document) {
+      documents[state.document.project.id] = state.document
+      sessions[state.document.project.id] = { dirty: state.dirty, history: state.history, future: state.future, selectedId: state.selectedId, playheadMs: state.playheadMs, search: state.search, lowConfidenceOnly: state.lowConfidenceOnly }
+    }
+    const switching = document && document === state.documents[document.project.id] && document.project.id !== state.document?.project.id
+    const session = switching ? sessions[document.project.id] : undefined
+    if (document) documents[document.project.id] = document
+    const task = state.queue.tasks.find((item) => item.projectId === document?.project.id && ['waiting', 'running', 'interrupted'].includes(item.state))
+    return { documents, sessions, document, selectedId: document?.project.segments[0]?.id, dirty: false, history: [], future: [], playheadMs: 0, search: '', lowConfidenceOnly: false, ...session, jobEvent: undefined, activeJobId: task?.jobId }
+  }),
   setModels: (models) => set({ models }),
   setTranslationProfiles: (translationProfiles) => set({ translationProfiles }),
   setRecent: (recent) => set({ recent }),
@@ -68,11 +127,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setPlayhead: (playheadMs) => set({ playheadMs }),
   setSearch: (search) => set({ search }),
   toggleLowConfidence: () => set((state) => ({ lowConfidenceOnly: !state.lowConfidenceOnly })),
-  setLanguage: (sourceLanguage) => set((state) => state.document ? ({
+  setLanguage: (sourceLanguage) => set((state) => state.document && !state.activeJobId ? ({
     document: { ...state.document, project: { ...state.document.project, sourceLanguage, updatedAt: new Date().toISOString() } },
     dirty: true
   }) : state),
-  setTranscriptionModel: (transcriptionModelId) => set((state) => state.document ? ({
+  setTranscriptionModel: (transcriptionModelId) => set((state) => state.document && !state.activeJobId ? ({
     document: {
       ...state.document,
       project: {
@@ -83,12 +142,17 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     },
     dirty: true
   }) : state),
-  setTranslationProfile: (translationProfileId) => set((state) => state.document ? ({
+  setTranslationProfile: (translationProfileId) => set((state) => state.document && !state.activeJobId ? ({
     document: { ...state.document, project: { ...state.document.project, settings: { ...state.document.project.settings, translationProfileId }, updatedAt: new Date().toISOString() } },
     dirty: true
   }) : state),
   setActiveJob: (activeJobId) => set({ activeJobId }),
   applyJobEvent: (event) => set((state) => {
+    if (event.projectId !== state.document?.project.id) {
+      const known = state.documents[event.projectId]
+      if (known && event.project) return { documents: { ...state.documents, [event.projectId]: { ...known, project: event.project } } }
+      return state
+    }
     if (state.activeJobId && event.jobId !== state.activeJobId) return state
     if (event.stage === 'completed' && event.project && state.document) {
       return {
@@ -111,7 +175,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     return { jobEvent: event }
   }),
   updateSegment: (id, patch) => set((state) => {
-    if (!state.document) return state
+    if (!state.document || state.activeJobId) return state
     const before = copySegments(state.document.project.segments)
     const segments = state.document.project.segments.map((segment) => segment.id === id
       ? { ...segment, ...patch, status: patch.status ?? 'edited' as const }
@@ -122,7 +186,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
   }),
   addSegment: () => set((state) => {
-    if (!state.document) return state
+    if (!state.document || state.activeJobId) return state
     const before = copySegments(state.document.project.segments)
     const sorted = [...state.document.project.segments].sort((a, b) => a.startMs - b.startMs)
     const selectedIndex = sorted.findIndex((segment) => segment.id === state.selectedId)
@@ -139,7 +203,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
   }),
   deleteSegment: (id) => set((state) => {
-    if (!state.document) return state
+    if (!state.document || state.activeJobId) return state
     const before = copySegments(state.document.project.segments)
     const index = state.document.project.segments.findIndex((segment) => segment.id === id)
     const segments = state.document.project.segments.filter((segment) => segment.id !== id)
@@ -150,7 +214,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
   }),
   splitSegment: (requestedId, requestedMs) => set((state) => {
-    if (!state.document) return state
+    if (!state.document || state.activeJobId) return state
     const id = requestedId ?? state.selectedId
     const segment = state.document.project.segments.find((item) => item.id === id)
     if (!segment) return state
@@ -174,7 +238,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
   }),
   mergeNext: (id) => set((state) => {
-    if (!state.document) return state
+    if (!state.document || state.activeJobId) return state
     const segments = [...state.document.project.segments].sort((a, b) => a.startMs - b.startMs)
     const index = segments.findIndex((segment) => segment.id === id)
     if (index < 0 || index >= segments.length - 1) return state
@@ -197,7 +261,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   }),
   mergeDuplicateSegments: () => {
     const state = get()
-    if (!state.document) return { segments: [], mergedCount: 0, skippedConflictCount: 0 }
+    if (!state.document || state.activeJobId) return { segments: [], mergedCount: 0, skippedConflictCount: 0 }
     const before = copySegments(state.document.project.segments)
     const result = mergeAdjacentDuplicateSegments(state.document.project.segments, { maxGapMs: 1000, protectEdited: true })
     if (!result.mergedCount) return result
@@ -217,7 +281,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     return result
   },
   repairOverlaps: (segmentIds) => set((state) => {
-    if (!state.document) return state
+    if (!state.document || state.activeJobId) return state
     const before = copySegments(state.document.project.segments)
     const segments = repairSegmentOverlaps(state.document.project.segments, segmentIds)
     const changed = segments.some((segment, index) => segment.startMs !== before[index].startMs || segment.endMs !== before[index].endMs)
@@ -228,7 +292,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
   }),
   undo: () => set((state) => {
-    if (!state.document || !state.history.length) return state
+    if (!state.document || state.activeJobId || !state.history.length) return state
     const previous = state.history.at(-1)!
     return {
       document: { ...state.document, project: projectWithSegments(state.document.project, copySegments(previous)) },
@@ -236,7 +300,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
   }),
   redo: () => set((state) => {
-    if (!state.document || !state.future.length) return state
+    if (!state.document || state.activeJobId || !state.future.length) return state
     const next = state.future[0]
     return {
       document: { ...state.document, project: projectWithSegments(state.document.project, copySegments(next)) },

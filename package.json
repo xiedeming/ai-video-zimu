@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:queue-electron": "node scripts/smoke-queue.cjs",
     "prepare:ffmpeg": "node scripts/fetch-sidecars.mjs --ffmpeg-only",
     "prepare:whisper": "node scripts/fetch-sidecars.mjs --whisper-only",
     "prepare:sidecars": "node scripts/fetch-sidecars.mjs",

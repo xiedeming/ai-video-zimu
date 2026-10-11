@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('node:fs/promises', () => ({
+  rm: vi.fn().mockResolvedValue(undefined),
   mkdir: mocks.mkdir,
   readFile: mocks.readFile
 }))
@@ -52,6 +53,19 @@ const project: ZimuProjectV1 = {
   segments: [{ id: 'segment-1', startMs: 0, endMs: 1000, sourceText: 'Hello', translatedText: '', words: [], confidence: 1, status: 'generated' }],
   createdAt: '2026-08-09T00:00:00.000Z',
   updatedAt: '2026-08-09T00:00:00.000Z'
+}
+
+function pipelineManager() {
+  mocks.resolveBinary.mockReset().mockImplementation(async (name: string) => name)
+  mocks.runProcess.mockReset().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 })
+  mocks.mkdir.mockReset().mockResolvedValue(undefined)
+  mocks.readFile.mockReset().mockResolvedValue(JSON.stringify({ result: { language: 'en' }, transcription: [{ text: 'Hello', offsets: { from: 0, to: 1000 } }] }))
+  mocks.translate.mockReset().mockImplementation(async (_profile, _language, batch) => new Map(batch.map((segment: { id: string }) => [segment.id, '你好'])))
+  const models = { assertReady: vi.fn().mockResolvedValue(undefined), pathFor: vi.fn((id) => id) } as unknown as ModelManager
+  const profiles = { resolve: vi.fn().mockResolvedValue({ profile: { id: profileId, kind: 'openai-compatible', model: 'remote', baseUrl: 'http://localhost/v1' } }) } as unknown as TranslationProfileManager
+  const manager = new JobManager(models, profiles)
+  const completed = new Promise<JobEvent>((resolve) => { manager.onEvent((event) => { if (['completed', 'failed', 'canceled'].includes(event.stage)) resolve(event) }) })
+  return { manager, completed }
 }
 
 describe('JobManager translation provider selection', () => {
@@ -184,5 +198,92 @@ describe('JobManager translation provider selection', () => {
     expect(event.project?.segments).toHaveLength(1)
     expect(event.project?.segments[0].translatedText).toBe('重复的一行')
     expect(mocks.translate).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries a failed GPU transcription on CPU within its own job', async () => {
+    const { manager, completed } = pipelineManager()
+    mocks.hasNvidiaGpu.mockResolvedValue(true)
+    mocks.spawnTracked.mockReset()
+      .mockReturnValueOnce({ child: { kill: vi.fn() }, result: Promise.reject(new Error('GPU unavailable')) })
+      .mockReturnValueOnce({ child: { kill: vi.fn() }, result: Promise.resolve({ stdout: '', stderr: '', exitCode: 0 }) })
+    manager.start(project, { translate: false, concurrency: 2 })
+    const event = await completed
+    expect(event.stage).toBe('completed')
+    expect(mocks.resolveBinary).toHaveBeenCalledWith('whisper-cli', false)
+    expect(mocks.spawnTracked.mock.calls[1][1]).toContain('--no-gpu')
+    expect(mocks.translate).not.toHaveBeenCalled()
+  })
+
+  it('saves transcription before translating and retains it on translation failure', async () => {
+    const { manager, completed } = pipelineManager()
+    mocks.spawnTracked.mockReset().mockReturnValue({ child: { kill: vi.fn() }, result: Promise.resolve({}) })
+    const checkpoint = vi.fn().mockResolvedValue(undefined)
+    mocks.translate.mockImplementation(async () => {
+      expect(checkpoint).toHaveBeenCalledOnce()
+      throw new Error('translation failed')
+    })
+    manager.start(project, { checkpoint })
+    const event = await completed
+    expect(event.stage).toBe('failed')
+    expect(event.project?.segments[0].sourceText).toBe('Hello')
+    expect(event.project?.segments[0].translatedText).toBe('')
+  })
+
+  it('does not translate or succeed if checkpoint saving fails', async () => {
+    const { manager, completed } = pipelineManager()
+    mocks.spawnTracked.mockReset().mockReturnValue({ child: { kill: vi.fn() }, result: Promise.resolve({}) })
+    manager.start(project, { checkpoint: vi.fn().mockRejectedValue(new Error('disk full')) })
+    expect((await completed).stage).toBe('failed')
+    expect(mocks.translate).not.toHaveBeenCalled()
+  })
+
+  it('serializes two local translations through a single shared process', async () => {
+    const models = { assertReady: vi.fn().mockResolvedValue(undefined), pathFor: vi.fn((id) => id) } as unknown as ModelManager
+    const profiles = { resolve: vi.fn().mockResolvedValue({ profile: { id: 'builtin-qwen3', kind: 'builtin', model: 'local' } }) } as unknown as TranslationProfileManager
+    const manager = new JobManager(models, profiles)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }))
+    const kill = vi.fn()
+    mocks.spawnTracked.mockReset().mockReturnValue({ child: { kill }, result: new Promise(() => undefined) })
+    mocks.resolveBinary.mockReset().mockResolvedValue('llama-server')
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    mocks.translate.mockReset().mockImplementation(async () => { await gate; return new Map([['segment-1', '你好']]) })
+    const results: JobEvent[] = []
+    manager.onEvent((event) => { if (event.stage === 'completed') results.push(event) })
+    try {
+      manager.retranslate(project)
+      manager.retranslate({ ...project, id: '10000000-0000-4000-8000-000000000001' })
+      await vi.waitFor(() => expect(mocks.translate).toHaveBeenCalledTimes(1))
+      release()
+      await vi.waitFor(() => expect(results).toHaveLength(2))
+      expect(mocks.spawnTracked).toHaveBeenCalledTimes(1)
+      expect(kill).not.toHaveBeenCalled()
+    } finally { manager.dispose(); vi.unstubAllGlobals() }
+    expect(kill).toHaveBeenCalledOnce()
+  })
+  it('cancels a task waiting for the local translator before the preceding task finishes', async () => {
+    const models = { assertReady: vi.fn().mockResolvedValue(undefined), pathFor: vi.fn((id) => id) } as unknown as ModelManager
+    const profiles = { resolve: vi.fn().mockResolvedValue({ profile: { id: 'builtin-qwen3', kind: 'builtin', model: 'local' } }) } as unknown as TranslationProfileManager
+    const manager = new JobManager(models, profiles)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }))
+    mocks.resolveBinary.mockReset().mockResolvedValue('llama-server')
+    mocks.spawnTracked.mockReset().mockReturnValue({ child: { kill: vi.fn() }, result: new Promise(() => undefined) })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    mocks.translate.mockReset().mockImplementation(async () => { await gate; return new Map([['segment-1', '你好']]) })
+    const events: JobEvent[] = []
+    manager.onEvent((event) => events.push(event))
+    try {
+      manager.retranslate(project)
+      await vi.waitFor(() => expect(mocks.translate).toHaveBeenCalledTimes(1))
+      const waiting = manager.retranslate({ ...project, id: '10000000-0000-4000-8000-000000000002' })
+      await Promise.resolve()
+      manager.cancel(waiting.jobId)
+      await vi.waitFor(() => expect(events.some((event) => event.jobId === waiting.jobId && event.stage === 'canceled')).toBe(true))
+      expect(events.some((event) => event.stage === 'completed')).toBe(false)
+      expect(mocks.translate).toHaveBeenCalledTimes(1)
+      release()
+      await vi.waitFor(() => expect(events.some((event) => event.stage === 'completed')).toBe(true))
+    } finally { release(); manager.dispose(); vi.unstubAllGlobals() }
   })
 })

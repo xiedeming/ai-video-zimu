@@ -3,6 +3,7 @@ import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { atomicWrite } from './atomic-file'
 import { getAppPaths, MEDIA_FILTERS, MODEL_MANIFEST } from './constants'
 import { inspectMedia } from './sidecars'
 import { projectSchema } from '../shared/schemas'
@@ -90,7 +91,7 @@ export async function saveProject(projectInput: ZimuProjectV1, existingPath?: st
     filePath = result.filePath
   }
   await mkdir(dirname(filePath), { recursive: true })
-  await writeFile(filePath, JSON.stringify(project, null, 2), 'utf8')
+  await atomicWrite(filePath, JSON.stringify(project, null, 2))
   await remember(filePath, project)
   return { project, filePath, mediaUrl: mediaUrl(project.media.path) }
 }
@@ -100,7 +101,7 @@ export async function autosaveProject(projectInput: ZimuProjectV1): Promise<stri
   await mkdir(paths.autosave, { recursive: true })
   const project = projectSchema.parse({ ...projectInput, updatedAt: new Date().toISOString() })
   const filePath = join(paths.autosave, `${project.id}.zimu`)
-  await writeFile(filePath, JSON.stringify(project, null, 2), 'utf8')
+  await atomicWrite(filePath, JSON.stringify(project, null, 2))
   return filePath
 }
 
